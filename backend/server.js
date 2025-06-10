@@ -59,11 +59,6 @@ function generateOTP() {
 }
 
 
-function isOtpExpired(createdAt) {
-  const OTP_EXPIRY_MINUTES = 3; // ✅ Set expiry to 3 minutes
-  const expiryTime = new Date(createdAt).getTime() + OTP_EXPIRY_MINUTES * 60 * 1000;
-  return Date.now() > expiryTime;
-}
 
 
 
@@ -92,7 +87,6 @@ const authenticateUser=(req,res,next)=>{
       res.status(400).send('invalid token')
     }
 }
-
 
 
 
@@ -129,6 +123,7 @@ app.post('/send-email-otp', (req, res) => {
   });
 });
 
+//setup nodemailer
 function sendEmailOtp(email, otp, res) {
   const transporter = nodemailer.createTransport({
     service: process.env.EMAIL_SERVICE,
