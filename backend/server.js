@@ -339,7 +339,7 @@ app.get('/users/:userId', (req, res) => {
 
 
 //normal field  update
-app.put('/users/update-profile/:userId', authenticateUser, (req, res) => {
+app.put('/users/:userId', authenticateUser, (req, res) => {
   const { userId } = req.params;
   const { name, dob, role, preferences } = req.body;
   const age = calculateAge(dob);
@@ -446,7 +446,7 @@ app.post('/users/verify-email-change', authenticateUser, (req, res) => {
   });
 });
 
-//phone change request by userid
+//phone change request by userid without check mail
 app.post('/users/request-phone-change', authenticateUser, (req, res) => {
   const { userId, newPhone } = req.body;
   const otp = generateOTP();
@@ -455,9 +455,12 @@ app.post('/users/request-phone-change', authenticateUser, (req, res) => {
   db.query(`SELECT * FROM users WHERE id = ?`, [userId], (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ error: 'User not found' });
 
+
+
+
    db.query(
-      `INSERT INTO otp_verification (phone, phone_otp, phone_otp_created_at, phone_otp_attempts)
-       VALUES (?, ?, NOW(), 1)
+      `INSERT INTO otp_verification (phone, phone_otp, phone_otp_created_at, phone_otp_attempts,email)
+       VALUES (?, ?, NOW(), 1,'')
        ON DUPLICATE KEY UPDATE 
        phone_otp = ?, phone_otp_created_at = NOW(), phone_otp_attempts = phone_otp_attempts + 1, is_phone_verified = FALSE`,
       [newPhone, otp, otp],
@@ -496,6 +499,9 @@ app.post('/users/verify-phone-change', authenticateUser, (req, res) => {
     });
   });
 });
+
+
+
 
 //delete user detail
 app.delete('/users/:userId',authenticateUser,(req,res)=>{
