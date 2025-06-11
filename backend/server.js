@@ -58,6 +58,12 @@ function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function isOtpExpired(createdAt) {
+  const OTP_EXPIRY_MINUTES = 3; // Set expiry to 3 minutes
+  const expiryTime = new Date(createdAt).getTime() + OTP_EXPIRY_MINUTES * 60 * 1000;
+  return Date.now() > expiryTime;
+}
+
 
 
 
