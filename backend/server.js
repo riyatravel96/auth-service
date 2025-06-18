@@ -4,18 +4,23 @@ require('dotenv').config();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const SECRET_KEY = process.env.JWT_SECRET;   //for JWT token
+
+//encryption key and algorithm
+const algorithm = 'aes-256-cbc';
+const key = Buffer.from(process.env.ENCRYPTION_KEY, 'hex'); 
 
 const nodemailer = require('nodemailer');
 const twilio = require('twilio');
 
 //twilio setup
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
-
-const SECRET_KEY = process.env.JWT_SECRET; 
 
 // MySQL DB Connection
   const db = mysql.createConnection({
@@ -31,8 +36,8 @@ db.connect(err => {
 });
 
 
-
 // Helper Functions
+
 function generateUserId(name, dob) {
   const namePart = name.slice(0, 4).toLowerCase();
   const yearPart = new Date(dob).getFullYear().toString().slice(-2);
@@ -64,11 +69,26 @@ function isOtpExpired(createdAt) {
   return Date.now() > expiryTime;
 }
 
+function encrypt(text) {
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv(algorithm, key, iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return { encrypted, iv: iv.toString('hex') };
+}
+
+
+function decrypt(encryptedText, ivHex) {
+  const iv = Buffer.from(ivHex, 'hex');
+  const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
 
 
 
-
-//middleware for JWT authentication
+//middleware for JWT authentication some token issue
 
 const authenticateUser=(req,res,next)=>{
   const token=req.header('Authorization');
@@ -93,7 +113,6 @@ const authenticateUser=(req,res,next)=>{
       res.status(400).send('invalid token')
     }
 }
-
 
 
 //send email otp
@@ -129,7 +148,7 @@ app.post('/send-email-otp', (req, res) => {
   });
 });
 
-//setup nodemailer
+     //setup nodemailer
 function sendEmailOtp(email, otp, res) {
   const transporter = nodemailer.createTransport({
     service: process.env.EMAIL_SERVICE,
@@ -148,6 +167,8 @@ function sendEmailOtp(email, otp, res) {
     res.json({ message: 'Email OTP sent successfully' });
   });
 }
+
+
 //verify email otp
 app.post('/verify-email-otp', (req, res) => {
   const { email, otp } = req.body;
@@ -209,6 +230,8 @@ app.post('/send-phone-otp', (req, res) => {
     }
   });
 });
+
+
 //verify phone otp
 app.post('/verify-phone-otp', (req, res) => {
   const { email, phone, otp } = req.body;
@@ -255,116 +278,167 @@ function sendSMSOtp(phone, otp, res) {
     });
 }
 
-
-
-
-
-
-// register after verifying email and mobile number
-
+//signup with encryption
 app.post('/users/register', async (req, res) => {
-  const { name, email, phone, password, dob, role, preferences } = req.body;
+    const { name, email, phone, password, dob, role, preferences } = req.body;
 
-  const checkSQL = `SELECT * FROM otp_verification WHERE email = ? AND phone = ?`;
-  db.query(checkSQL, [email, phone], async (err, results) => {
-    if (err) return res.status(500).json({ error: err.message });
+    // Check OTP is verified or not
+    const checkSQL = `SELECT * FROM otp_verification WHERE email = ? AND phone = ?`;
+    db.query(checkSQL, [email, phone], async (err, results) => {
+        if (err) return res.status(500).json({ error: err.message });
 
-    if (results.length === 0) {
-      return res.status(400).json({ error: 'Please verify email and phone first' });
-    }
+        if (results.length === 0) {
+            return res.status(400).json({ error: 'Please verify email and phone first' });
+        }
+        const record = results[0];
+        if (!record.is_email_verified || !record.is_phone_verified) {
+            return res.status(400).json({ error: 'Email or phone not verified' });
+        }
 
-    const record = results[0];
-    if (!record.is_email_verified || !record.is_phone_verified) {
-      return res.status(400).json({ error: 'Email or phone not verified' });
-    }
+        // Generate unique user ID
+        let id;
+        let isUnique = false;
+        while (!isUnique) {
+            id = generateUserId(name, dob);
+            const [existing] = await new Promise((resolve, reject) => {
+                db.query(`SELECT id FROM users WHERE id = ?`, [id], (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result);
+                });
+            });
+            if (!existing) isUnique = true;
+        }
 
-    // Generate unique user ID
-    let id;
-    let isUnique = false;
-    while (!isUnique) {
-      id = generateUserId(name, dob);
-      const [existing] = await new Promise((resolve, reject) => {
-        db.query(`SELECT id FROM users WHERE id = ?`, [id], (err, result) => {
-          if (err) reject(err);
-          else resolve(result);
+        const age = calculateAge(dob);
+        const hashed = await bcrypt.hash(password, 10);
+
+        // Encrypt each field
+        const encryptedName = encrypt(name);
+        const encryptedEmail = encrypt(email);
+        const encryptedPhone = encrypt(phone);
+        const encryptedDob = encrypt(dob);
+
+        const insertSQL = `
+          INSERT INTO users (
+            id, 
+            name_encrypted, name_iv, 
+            email_encrypted, email_iv, 
+            phone_encrypted, phone_iv, 
+            dob_encrypted, dob_iv, 
+            password_hash, 
+            age, role, preferences
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        db.query(insertSQL, [
+            id,
+            encryptedName.encrypted, encryptedName.iv,
+            encryptedEmail.encrypted, encryptedEmail.iv,
+            encryptedPhone.encrypted, encryptedPhone.iv,
+            encryptedDob.encrypted, encryptedDob.iv,
+            hashed,
+            age, role, preferences || 'user'
+        ], (err2, result) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+
+            res.status(201).json({ message: 'User registered successfully', userId: id });
         });
-      });
-      if (!existing) isUnique = true;
-    }
-
-    const age = calculateAge(dob);
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    const insertSQL = `
-      INSERT INTO users (id, name, email, phone, password, dob, age, role, preferences)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
-    db.query(insertSQL, [id, name, email, phone, hashedPassword, dob, age, role, preferences || 'user'], (err2, result) => {
-      if (err2) return res.status(500).json({ error: err2.message });
-
-      res.status(201).json({ message: 'User registered successfully', userId: id });
     });
-  });
 });
 
-//  login user with token
+
+//login 
 app.post('/users/login', (req, res) => {
   const { email, password } = req.body;
-  const sql='SELECT * FROM users WHERE email = ?'
-  db.query(sql, [email], async (err, results) => {
-    if (err || results.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const user = results[0];
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+  const sql = 'SELECT * FROM users';
+  db.query(sql, async (err, results) => {
+    if (err) {
+      console.log('Database error:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
 
-    const token = jwt.sign({ id: user.id, role: user.role }, SECRET_KEY, { expiresIn: '1d' });
+    let user = null;
+
+    // decrypt email one by one and compare
+    for (let u of results) {
+      const decryptedEmail = decrypt(u.email_encrypted, u.email_iv);
+      if (decryptedEmail === email) {
+        user = u;
+        break;
+      }
+    }
+
+    if (!user) {
+      console.log('Email not matched after decryption');
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+      console.log('Password mismatch');
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign({ id: user.id, role: user.role }, SECRET_KEY, {
+      expiresIn: '1d'
+    });
+
     res.json({ message: 'Login successful', token });
   });
 });
 
-// logout  user (dummy – token will expire in 1 day)
+// logout  user (dummy)
 app.post('/users/logout', (req, res) => {
   res.json({ message: 'Logout successful (handled on frontend by deleting token)' });
 });
 
-// fetch user detail by userId
-app.get('/users/:userId', (req, res) => {
-  const { userId } = req.params;
-  const sql='SELECT id, name, email, phone, dob, age, role, preferences FROM users WHERE id = ?';
-  db.query(sql, [userId], (err, results) => {
-    if (err || results.length === 0) return res.status(404).json({ error: 'User not found' });
-    res.json(results[0]);
-  });
-});
 
+//fetch user detail by userId  (decrypted format)
+app.get('/users/:id', (req, res) => {
+  const { id } = req.params;
 
-//normal field  update
-app.put('/users/:userId', authenticateUser, (req, res) => {
-  const { userId } = req.params;
-  const { name, dob, role, preferences } = req.body;
-  const age = calculateAge(dob);
-
-  const sql = `
-    UPDATE users 
-    SET name = ?, dob = ?, age = ?, role = ?, preferences = ?
-    WHERE id = ?
+  const fetchSQL = `
+    SELECT id, name_encrypted, name_iv, email_encrypted, email_iv,
+           phone_encrypted, phone_iv, dob_encrypted, dob_iv,
+           age, role, preferences
+    FROM users WHERE id = ?
   `;
-  db.query(sql, [name, dob, age, role, preferences, userId], (err, result) => {
+
+  db.query(fetchSQL, [id], (err, results) => {
     if (err) return res.status(500).json({ error: err.message });
-    if (result.affectedRows === 0) return res.status(404).json({ error: 'User not found' });
-    res.json({ message: 'Profile updated successfully' });
+    if (results.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    const user = results[0];
+
+    //  Decrypt fields
+    const decryptedUser = {
+      id: user.id,
+      name: decrypt(user.name_encrypted, user.name_iv),
+      email: decrypt(user.email_encrypted, user.email_iv),
+      phone: decrypt(user.phone_encrypted, user.phone_iv),
+      dob: decrypt(user.dob_encrypted, user.dob_iv),
+      age: user.age,
+      role: user.role,
+      preferences: user.preferences
+    };
+
+    res.json(decryptedUser);
   });
 });
 
-//password change with  mobile otp
+
+//password change by userId
 app.post('/users/request-password-change', authenticateUser, (req, res) => {
   const { userId } = req.body;
 
-  db.query(`SELECT phone FROM users WHERE id=?`, [userId], (err, results) => {
+  db.query(`SELECT phone_encrypted, phone_iv FROM users WHERE id = ?`, [userId], (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ error: 'User not found' });
 
-    const phone = results[0].phone;
+    const encryptedPhone = results[0].phone_encrypted;
+    const phoneIv = results[0].phone_iv;
+    const phone = decrypt(encryptedPhone, phoneIv); // decrypt phone
+
     const otp = generateOTP();
 
     db.query(
@@ -378,25 +452,27 @@ app.post('/users/request-password-change', authenticateUser, (req, res) => {
   });
 });
 
-//verify otp and changed password
+//password verify 
 app.post('/users/verify-password-change', async (req, res) => {
   const { userId, newPassword, otp } = req.body;
 
-  db.query(`SELECT phone FROM users WHERE id = ?`, [userId], async (err, results) => {
+  db.query(`SELECT phone_encrypted, phone_iv FROM users WHERE id = ?`, [userId], async (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ error: 'User not found' });
 
-    const phone = results[0].phone;
+    const phone = decrypt(results[0].phone_encrypted, results[0].phone_iv); //  decrypt phone
 
     db.query(`SELECT * FROM otp_verification WHERE phone = ?`, [phone], async (err2, result2) => {
       if (err2 || result2.length === 0) return res.status(404).json({ error: 'OTP not found' });
 
       const record = result2[0];
       const otpTime = new Date(record.phone_otp_created_at);
+
       if (isOtpExpired(otpTime)) return res.status(400).json({ error: 'OTP expired' });
       if (record.phone_otp !== otp) return res.status(401).json({ error: 'Invalid OTP' });
 
       const hashed = await bcrypt.hash(newPassword, 10);
-      db.query(`UPDATE users SET password = ? WHERE id = ?`, [hashed, userId], (err3) => {
+
+      db.query(`UPDATE users SET password_hash = ? WHERE id = ?`, [hashed, userId], (err3) => {
         if (err3) return res.status(500).json({ error: err3.message });
         res.json({ message: 'Password updated successfully' });
       });
@@ -404,18 +480,26 @@ app.post('/users/verify-password-change', async (req, res) => {
   });
 });
 
-//email change request by userId
+
+//email change by userID
 app.post('/users/request-email-change', authenticateUser, (req, res) => {
   const { userId, newEmail } = req.body;
   const otp = generateOTP();
 
-  db.query(`SELECT email FROM users WHERE id = ?`, [userId], (err, results) => {
+  // Encrypt the new email
+  const encrypted = encrypt(newEmail);
+  const encryptedEmail = encrypted.encrypted;
+  const emailIv = encrypted.iv;
+
+  // Check if user exists
+  db.query(`SELECT email_encrypted FROM users WHERE id = ?`, [userId], (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ error: 'User not found' });
 
     db.query(
       `INSERT INTO otp_verification (email, email_otp, email_otp_created_at, email_otp_attempts) 
-       VALUES (?, ?, NOW(), 1) ON DUPLICATE KEY UPDATE 
-       email_otp=?, email_otp_created_at=NOW(), email_otp_attempts=email_otp_attempts+1, is_email_verified=FALSE`,
+       VALUES (?, ?, NOW(), 1) 
+       ON DUPLICATE KEY UPDATE 
+       email_otp = ?, email_otp_created_at = NOW(), email_otp_attempts = email_otp_attempts + 1, is_email_verified = FALSE`,
       [newEmail, otp, otp],
       (err2) => {
         if (err2) return res.status(500).json({ error: err2.message });
@@ -425,7 +509,7 @@ app.post('/users/request-email-change', authenticateUser, (req, res) => {
   });
 });
 
-//verify modified email
+//verify newEmail
 app.post('/users/verify-email-change', authenticateUser, (req, res) => {
   const { userId, newEmail, otp } = req.body;
 
@@ -436,50 +520,58 @@ app.post('/users/verify-email-change', authenticateUser, (req, res) => {
     if (isOtpExpired(record.email_otp_created_at)) return res.status(400).json({ error: 'OTP expired' });
     if (record.email_otp !== otp) return res.status(401).json({ error: 'Invalid OTP' });
 
-    db.query(`UPDATE users SET email = ? WHERE id = ?`, [newEmail, userId], (err2) => {
-      if (err2) return res.status(500).json({ error: err2.message });
+    // Encrypt new email
+    const encrypted = encrypt(newEmail);
+    const encryptedEmail = encrypted.encrypted;
+    const emailIv = encrypted.iv;
 
-      // Remove old email from OTP table
-      db.query(`DELETE FROM otp_verification WHERE email != ? AND phone IS NULL`, [newEmail], () => {
-        res.json({ message: 'Email updated successfully' });
-      });
-    });
+    // Update encrypted email
+    db.query(
+      `UPDATE users SET email_encrypted = ?, email_iv = ? WHERE id = ?`,
+      [encryptedEmail, emailIv, userId],
+      (err2) => {
+        if (err2) return res.status(500).json({ error: err2.message });
+
+        //  Remove old email OTP record
+        db.query(
+          `DELETE FROM otp_verification WHERE email != ? AND phone IS NULL`,
+          [newEmail],
+          () => res.json({ message: 'Email updated successfully' })
+        );
+      }
+    );
   });
 });
 
-//phone change request by userid without check mail
+// phone change by userID
+
 app.post('/users/request-phone-change', authenticateUser, (req, res) => {
   const { userId, newPhone } = req.body;
   const otp = generateOTP();
 
- 
   db.query(`SELECT * FROM users WHERE id = ?`, [userId], (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ error: 'User not found' });
 
-
-
-
-   db.query(
-      `INSERT INTO otp_verification (phone, phone_otp, phone_otp_created_at, phone_otp_attempts,email)
-       VALUES (?, ?, NOW(), 1,'')
+    db.query(
+      `INSERT INTO otp_verification (phone, phone_otp, phone_otp_created_at, phone_otp_attempts, email)
+       VALUES (?, ?, NOW(), 1, '')
        ON DUPLICATE KEY UPDATE 
        phone_otp = ?, phone_otp_created_at = NOW(), phone_otp_attempts = phone_otp_attempts + 1, is_phone_verified = FALSE`,
       [newPhone, otp, otp],
       (err2) => {
         if (err2) return res.status(500).json({ error: err2.message });
 
-        //  Send SMS OTP
-        sendSMSOtp(newPhone, otp, res);  
+        sendSMSOtp(newPhone, otp, res);
       }
     );
   });
 });
+ 
+//verify newPhone
 
-//verify modified phone number
 app.post('/users/verify-phone-change', authenticateUser, (req, res) => {
   const { userId, newPhone, otp } = req.body;
 
-  // Check OTP validity
   db.query(`SELECT * FROM otp_verification WHERE phone = ?`, [newPhone], (err, results) => {
     if (err || results.length === 0) return res.status(404).json({ error: 'OTP record not found for this phone' });
 
@@ -489,39 +581,45 @@ app.post('/users/verify-phone-change', authenticateUser, (req, res) => {
     if (isOtpExpired(otpTime)) return res.status(400).json({ error: 'OTP expired' });
     if (record.phone_otp !== otp) return res.status(401).json({ error: 'Invalid OTP' });
 
-    // Update phone number in users table
-    db.query(`UPDATE users SET phone = ? WHERE id = ?`, [newPhone, userId], (err2) => {
-      if (err2) return res.status(500).json({ error: err2.message });
+    // Encrypt new phone
+    const { encrypted, iv } = encrypt(newPhone);
 
-      // Delete all old phone OTP entries except new one
-      db.query(`DELETE FROM otp_verification WHERE phone != ? AND email IS NULL`, [newPhone], () => {
-        res.json({ message: 'Phone number updated successfully' });
-      });
-    });
+    db.query(
+      `UPDATE users SET phone_encrypted = ?, phone_iv = ? WHERE id = ?`,
+      [encrypted, iv, userId],
+      (err2) => {
+        if (err2) return res.status(500).json({ error: err2.message });
+
+        //  Clean up old entries
+        db.query(`DELETE FROM otp_verification WHERE phone != ? AND email IS NULL`, [newPhone], () => {
+          res.json({ message: 'Phone number updated successfully' });
+        });
+      }
+    );
   });
 });
 
 
 
-
 //delete user detail
-app.delete('/users/:userId',authenticateUser,(req,res)=>{
-  const {userId}=req.params;
-  const sql='DELETE from users where id=?'
-  db.query(sql,[userId],(err,result)=>{
-    if(err){
-      console.error(err.message);
-      res.status(500).send('internal server error')
+app.delete('/users/:userId', authenticateUser, (req, res) => {
+  const { userId } = req.params;
+
+  const sql = 'DELETE FROM users WHERE id = ?';
+  db.query(sql, [userId], (err, result) => {
+    if (err) {
+      console.error('Error deleting user:', err.message);
+      return res.status(500).json({ error: 'Internal server error' });
     }
-    else if(result.affectedRows===0)
-    {
-      res.status(403).send('user not found')
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'User not found' });
     }
-    else{
-      res.send('user account deleted')
-    }
-  })
-})
+
+    res.json({ message: 'User account deleted successfully' });
+  });
+});
+
 
 
 //  Start Server
